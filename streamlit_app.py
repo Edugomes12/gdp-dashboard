@@ -1,180 +1,166 @@
 import streamlit as st
 import requests
-import re
 import pandas as pd
+import re
+import time
 from io import BytesIO
 
 # ==========================================
-# BACKEND: REGRAS DE NEGÓCIO E REQUISIÇÕES
+# BACKEND: REGRAS DE NEGÓCIO E APIs
 # ==========================================
 
-def limpar_e_validar_cep(cep: str) -> str:
-    """Remove caracteres não numéricos. Retorna o CEP se tiver 8 dígitos, senão None."""
-    cep_limpo = re.sub(r'\D', '', cep)
-    return cep_limpo if len(cep_limpo) == 8 else None
+def limpar_cep(cep) -> str:
+    """Extrai apenas números e garante 8 dígitos com zeros à esquerda."""
+    cep_str = str(cep)
+    cep_limpo = re.sub(r'\D', '', cep_str)
+    if not cep_limpo:
+        return None
+    return cep_limpo.zfill(8)
 
 def buscar_viacep(cep: str) -> dict:
-    """Consulta a API gratuita do ViaCEP e trata erros de ligação."""
+    """Consulta o endereço no ViaCEP."""
     url = f"https://viacep.com.br/ws/{cep}/json/"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         dados = response.json()
-        
         if dados.get("erro"):
-            return {"erro": "CEP não encontrado na base dos Correios."}
+            return None
         return dados
-        
-    except requests.exceptions.Timeout:
-        return {"erro": "A ligação excedeu o tempo limite. Tente novamente."}
-    except requests.exceptions.RequestException as e:
-        return {"erro": f"Erro de comunicação com o ViaCEP: {str(e)}"}
+    except:
+        return None
 
-def normalizar_coluna_cep(df: pd.DataFrame) -> pd.Series:
-    """Garante que a coluna de CEPs do dataframe seja tratada, reconstruindo zeros perdidos."""
-    # Procura a coluna de forma flexível, ignorando espaços invisíveis (BOM)
-    coluna_cep = [col for col in df.columns if 'CEP' in col.upper()]
+def buscar_lat_long(logradouro: str, cidade: str, estado: str) -> tuple:
+    """
+    Consulta o OpenStreetMap (Nominatim) para converter o endereço em Coordenadas.
+    Retorna (Latitude, Longitude).
+    """
+    # O Nominatim exige um User-Agent válido para solicitações gratuitas
+    headers = {'User-Agent': 'BuscadorLatLongApp/1.0 (seu_email@exemplo.com)'}
     
-    if coluna_cep:
-        nome_col = coluna_cep[0]
-        # 1. Converte para texto
-        # 2. Extrai estritamente os números
-        ceps_limpos = df[nome_col].astype(str).str.replace(r'\D', '', regex=True)
-        # 3. Adiciona os zeros perdidos à esquerda até formar os 8 dígitos necessários (.zfill)
-        return ceps_limpos.apply(lambda x: x.zfill(8) if len(x) > 0 else x)
-        
-    return pd.Series(dtype=str)
-
-def inicializar_estado():
-    """Inicializa o histórico de pesquisas na sessão atual."""
-    if 'historico' not in st.session_state:
-        st.session_state.historico = pd.DataFrame(columns=[
-            'CEP', 'Logradouro', 'Bairro', 'Localidade', 'UF', 'Latitude', 'Longitude'
-        ])
+    # Montamos a query com os dados do ViaCEP
+    query = f"{logradouro}, {cidade}, {estado}, Brazil"
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        'q': query,
+        'format': 'json',
+        'limit': 1
+    }
+    
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        dados = response.json()
+        if dados:
+            return dados[0].get('lat'), dados[0].get('lon')
+        return None, None
+    except:
+        return None, None
 
 # ==========================================
-# FRONTEND: LAYOUT E INTERFACE (STREAMLIT)
+# FRONTEND: INTERFACE STREAMLIT
 # ==========================================
 
 def main():
-    st.set_page_config(page_title="Geocoding & CEP Analyzer", page_icon="🌍", layout="wide")
-    inicializar_estado()
-
-    st.title("🌍 Hub do Pesquisador: Pesquisa e Validação de CEPs")
-    st.markdown("Interface otimizada para cruzamento de endereços com a sua base de coordenadas.")
+    st.set_page_config(page_title="Processador em Lote de CEPs", page_icon="📍", layout="wide")
+    
+    st.title("📍 Enriquecedor de Planilhas: CEP para Lat/Long")
+    st.markdown("Faça o upload da sua planilha. O sistema irá ler todos os CEPs, buscar o endereço no ViaCEP e obter a Latitude e Longitude exatas no OpenStreetMap.")
     st.divider()
 
-    # --- BARRA LATERAL (SIDEBAR) ---
-    with st.sidebar:
-        st.header("📂 Gerir Base de Dados")
-        st.write("Carregue o seu ficheiro `Edu` (CSV ou Excel) para cruzar dados.")
-        
-        arquivo_upload = st.file_uploader("Selecione a sua base", type=["csv", "xlsx"])
-        df_base = None
-        
-        if arquivo_upload is not None:
-            try:
-                # Motor super robusto: deteta vírgulas/ponto-e-vírgula e codificações problemáticas automaticamente
-                if arquivo_upload.name.endswith('.csv'):
-                    df_base = pd.read_csv(arquivo_upload, sep=None, engine='python', encoding='utf-8-sig')
-                else:
-                    df_base = pd.read_excel(arquivo_upload)
-                
-                st.success("✅ Base carregada com sucesso!")
-                st.metric(label="Total de Registos", value=len(df_base))
-            except Exception as e:
-                st.error(f"Erro ao ler o ficheiro: {e}")
+    # 1. Upload do Arquivo
+    arquivo_upload = st.file_uploader("Carregue seu arquivo CSV ou Excel (ex: Edu.xlsx)", type=["csv", "xlsx"])
 
-    # --- ESTRUTURA DE ABAS PRINCIPAIS ---
-    aba_busca, aba_base, aba_exportacao = st.tabs([
-        "🔍 1. Nova Pesquisa", 
-        "📊 2. Visualizar Base Carregada", 
-        "💾 3. Histórico e Exportação"
-    ])
-
-    with aba_busca:
-        st.subheader("Consultar ViaCEP")
-        
-        col_input, col_btn, _ = st.columns([2, 1, 3])
-        
-        with col_input:
-            cep_input = st.text_input("Digite o CEP:", placeholder="Ex: 01001-000", label_visibility="collapsed")
-        with col_btn:
-            btn_buscar = st.button("Pesquisar Endereço", type="primary", use_container_width=True)
-
-        if btn_buscar:
-            cep_valido = limpar_e_validar_cep(cep_input)
-            
-            if not cep_valido:
-                st.warning("⚠️ Formato inválido. O CEP deve conter exatamente 8 dígitos numéricos.")
+    if arquivo_upload is not None:
+        try:
+            # Tenta ler o arquivo de forma robusta
+            if arquivo_upload.name.endswith('.csv'):
+                df = pd.read_csv(arquivo_upload, sep=None, engine='python', encoding='utf-8-sig')
             else:
-                with st.spinner("A consultar a base dos Correios via ViaCEP..."):
-                    resultado = buscar_viacep(cep_valido)
+                df = pd.read_excel(arquivo_upload)
+            
+            st.success(f"✅ Arquivo carregado com {len(df)} linhas!")
+            st.dataframe(df.head(5), use_container_width=True) # Mostra uma prévia
+
+            # Identifica a coluna de CEP
+            colunas_cep = [col for col in df.columns if 'CEP' in col.upper()]
+            
+            if not colunas_cep:
+                st.error("❌ Não encontrei nenhuma coluna chamada 'CEP' na planilha.")
+                return
+            
+            nome_col_cep = colunas_cep[0]
+
+            # Se as colunas Lat/Long não existirem, cria-as
+            if 'Latitude' not in df.columns:
+                df['Latitude'] = ""
+            if 'Longitude' not in df.columns:
+                df['Longitude'] = ""
+            if 'Logradouro_Encontrado' not in df.columns:
+                df['Logradouro_Encontrado'] = ""
+
+            st.info("Pressione o botão abaixo para começar a pesquisar as coordenadas para cada CEP da planilha.")
+            
+            # 2. Botão de Processamento
+            if st.button("🚀 Processar todos os CEPs", type="primary"):
                 
-                if "erro" in resultado:
-                    st.error(f"❌ {resultado['erro']}")
-                else:
-                    st.success(f"✅ Endereço localizado para o CEP {resultado.get('cep')}")
-                    
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("UF", resultado.get('uf', '-'))
-                    c2.metric("Cidade", resultado.get('localidade', '-'))
-                    c3.metric("Bairro", resultado.get('bairro', '-'))
-                    c4.metric("Logradouro", resultado.get('logradouro', '-'))
-                    
-                    # --- CRUZAMENTO COM O SEU FICHEIRO EDU ---
-                    if df_base is not None:
-                        ceps_base = normalizar_coluna_cep(df_base)
-                        if cep_valido in ceps_base.values:
-                            st.info("📌 **Aviso:** Este CEP **JÁ CONSTA** na sua base importada.")
-                        else:
-                            st.info("✨ **Aviso:** Este é um **NOVO CEP** e não está na sua base.")
-                    else:
-                        st.info("Nenhuma base de dados carregada para comparação.")
+                barra_progresso = st.progress(0)
+                texto_status = st.empty()
+                total_linhas = len(df)
+                
+                # Prepara cópia do dataframe para atualizar
+                df_resultado = df.copy()
 
-                    novo_registro = {
-                        'CEP': resultado.get('cep'),
-                        'Logradouro': resultado.get('logradouro'),
-                        'Bairro': resultado.get('bairro'),
-                        'Localidade': resultado.get('localidade'),
-                        'UF': resultado.get('uf'),
-                        'Latitude': '',  
-                        'Longitude': ''  
-                    }
+                for index, row in df_resultado.iterrows():
+                    cep_atual = limpar_cep(row[nome_col_cep])
+                    texto_status.text(f"Processando linha {index + 1} de {total_linhas}... (CEP: {cep_atual})")
                     
-                    historico_atualizado = pd.concat([
-                        st.session_state.historico, 
-                        pd.DataFrame([novo_registro])
-                    ], ignore_index=True)
-                    st.session_state.historico = historico_atualizado.drop_duplicates(subset=['CEP'], keep='last')
+                    if cep_atual:
+                        # Passo A: ViaCEP
+                        dados_endereco = buscar_viacep(cep_atual)
+                        
+                        if dados_endereco:
+                            logradouro = dados_endereco.get('logradouro', '')
+                            cidade = dados_endereco.get('localidade', '')
+                            estado = dados_endereco.get('uf', '')
+                            
+                            df_resultado.at[index, 'Logradouro_Encontrado'] = f"{logradouro}, {cidade} - {estado}"
+                            
+                            # Passo B: Nominatim (Lat e Long)
+                            if logradouro and cidade and estado:
+                                lat, lon = buscar_lat_long(logradouro, cidade, estado)
+                                df_resultado.at[index, 'Latitude'] = lat
+                                df_resultado.at[index, 'Longitude'] = lon
+                                
+                                # Pausa obrigatória de 1 segundo (Regra do OpenStreetMap para evitar bloqueio)
+                                time.sleep(1)
+                    
+                    # Atualiza a barra de progresso
+                    progresso_atual = (index + 1) / total_linhas
+                    barra_progresso.progress(progresso_atual)
 
-    with aba_base:
-        if df_base is not None:
-            st.subheader(f"Base Original: {arquivo_upload.name}")
-            st.dataframe(df_base, use_container_width=True, height=400)
-        else:
-            st.info("Utilize a barra lateral para carregar a sua folha de cálculo.")
+                texto_status.success("🎉 Processamento concluído com sucesso!")
+                
+                # 3. Exibição do Resultado
+                st.subheader("📊 Planilha Atualizada")
+                st.dataframe(df_resultado, use_container_width=True)
+                
+                # 4. Exportação (Download)
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    df_resultado.to_excel(writer, index=False, sheet_name='CEPs_Processados')
+                dados_excel = output.getvalue()
+                
+                st.download_button(
+                    label="📥 Baixar Planilha com Latitude e Longitude",
+                    data=dados_excel,
+                    file_name="base_com_coordenadas.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
 
-    with aba_exportacao:
-        st.subheader("CEPs Processados nesta Sessão")
-        
-        if st.session_state.historico.empty:
-            st.write("Nenhum CEP foi pesquisado com sucesso ainda.")
-        else:
-            st.dataframe(st.session_state.historico, use_container_width=True)
-            
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                st.session_state.historico.to_excel(writer, index=False, sheet_name='Novos_Enderecos')
-            dados_excel = output.getvalue()
-            
-            st.download_button(
-                label="📥 Descarregar 'novos_enderecos.xlsx'",
-                data=dados_excel,
-                file_name="novos_enderecos.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary"
-            )
+        except Exception as e:
+            st.error(f"Erro ao processar arquivo: {e}")
 
 if __name__ == "__main__":
     main()
